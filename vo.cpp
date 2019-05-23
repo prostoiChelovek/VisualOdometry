@@ -4,11 +4,11 @@ using namespace std;
 using namespace cv;
 
 
-VO::VO(const cv::Mat &_K, float _baseline, const string &_left_path, const string &_right_path)
-        : K(_K), baseline(_baseline) {
-    left_image_path = _left_path;
-    right_image_path = _right_path;
-}
+VO::VO(const cv::Mat &_K, float _baseline)
+        : K(_K), baseline(_baseline) {}
+
+VO::VO(const cv::Mat &_K, float _baseline, const cv::Mat &firstImg)
+        : prevImg(firstImg), K(_K), baseline(_baseline) {}
 
 vector<Point3f> VO::get3D_Points(const vector<Point2f> &feature_p1, const vector<Point2f> &feature_p2) const {
     // This is to generate the 3D points
@@ -44,7 +44,7 @@ vector<Point3f> VO::get3D_Points(const vector<Point2f> &feature_p1, const vector
 }
 
 void VO::extract_keypoints_surf(const Mat &img1, const Mat &img2, vector<Point3f> &landmarks,
-                                vector<Point2f> &feature_points) const {
+                                vector<Point2f> &feature_points) {
     assert(landmarks.empty());
     assert(feature_points.empty());
 
@@ -100,21 +100,18 @@ void VO::extract_keypoints_surf(const Mat &img1, const Mat &img2, vector<Point3f
 }
 
 
-void VO::create_new_features(int start, const Mat &inv_transform, std::vector<Point2f> &featurePoints,
-                             std::vector<Point3f> &landmarks) const {
-
+void VO::create_new_features(const cv::Mat &leftImg, const cv::Mat &rightImg,
+                             std::vector<Point3f> &landmarks, const Mat &inv_transform,
+                             std::vector<Point2f> &featurePoints) {
     if (!featurePoints.empty()) {
         featurePoints.clear();
         landmarks.clear();
     }
 
-    Mat curImage_L = getImage(left_image_path, start);
-    Mat curImage_R = getImage(right_image_path, start);
-
     vector<Point3f> landmark_3D_new;
     vector<Point2f> reference_2D_new;
 
-    extract_keypoints_surf(curImage_L, curImage_R, landmark_3D_new, reference_2D_new);
+    extract_keypoints_surf(leftImg, rightImg, landmark_3D_new, reference_2D_new);
 
     for (int k = 0; k < landmark_3D_new.size(); k++) {
         const Point3f &pt = landmark_3D_new[k];
@@ -152,91 +149,45 @@ void tracking(const cv::Mat &ref_img, const cv::Mat &curImg, const std::vector<P
     }
 }
 
-void VO::playSequence(const std::vector<std::vector<float>> &poses) const {
-    int startIndex = 0;
-    Mat left_img = getImage(left_image_path, startIndex);
-    Mat right_img = getImage(right_image_path, startIndex);
-    Mat &ref_img = left_img;
+shared_ptr<Point2f> VO::computePose(const cv::Mat &leftImg, const cv::Mat &rightImg,
+                                    vector<Point3f> &landmarks, vector<Point2f> &featurePoints) {
+    const Mat &curImg = leftImg;
 
-    vector<Point3f> landmarks;
-    vector<Point2f> featurePoints;
+    std::vector<Point3f> landmarks_ref;
+    std::vector<Point2f> featurePoints_ref;
 
-    extract_keypoints_surf(left_img, right_img, landmarks, featurePoints);
+    tracking(prevImg, curImg, featurePoints, landmarks, landmarks_ref, featurePoints_ref);
 
-    // featurePoints_ref = featurePoints;
-    // landmarks_ref 	  = landmarks;
+    if (landmarks_ref.empty()) return nullptr;
 
-    Mat curImg;
+    Mat dist_coeffs = Mat::zeros(4, 1, CV_64F);
+    Mat rvec, tvec;
+    vector<int> inliers;
 
-    Mat traj = Mat::zeros(600, 600, CV_8UC3);
+    solvePnPRansac(landmarks_ref, featurePoints_ref, K, dist_coeffs, rvec, tvec, false,
+                   100, 8.0, 0.99, inliers);
 
-    for (int i = startIndex + 1; i < max_frame; i++) {
-        cout << i << endl;
+    if (inliers.size() < 5) return nullptr;
 
-        curImg = getImage(left_image_path, i);
+    Mat R_matrix;
+    Rodrigues(rvec, R_matrix);
+    R_matrix = R_matrix.t();
+    Mat t_vec = -R_matrix * tvec;
 
-        std::vector<Point3f> landmarks_ref;
-        std::vector<Point2f> featurePoints_ref;
+    Mat inv_transform = Mat::zeros(3, 4, CV_64F);
+    R_matrix.col(0).copyTo(inv_transform.col(0));
+    R_matrix.col(1).copyTo(inv_transform.col(1));
+    R_matrix.col(2).copyTo(inv_transform.col(2));
+    t_vec.copyTo(inv_transform.col(3));
 
-        tracking(ref_img, curImg, featurePoints, landmarks, landmarks_ref, featurePoints_ref);
+    create_new_features(leftImg, rightImg, landmarks, inv_transform, featurePoints);
 
-        if (landmarks_ref.empty()) continue;
+    curImg.copyTo(prevImg);
 
-        Mat dist_coeffs = Mat::zeros(4, 1, CV_64F);
+    t_vec.convertTo(t_vec, CV_32F);
+    cout << t_vec.t() << endl;
 
-        Mat rvec, tvec;
-
-        vector<int> inliers;
-
-        solvePnPRansac(landmarks_ref, featurePoints_ref, K, dist_coeffs, rvec, tvec, false,
-                       100, 8.0, 0.99, inliers);
-
-        if (inliers.size() < 5) continue;
-
-        float inliers_ratio = inliers.size() / float(landmarks_ref.size());
-
-        cout << "inliers ratio: " << inliers_ratio << endl;
-
-        Mat R_matrix;
-        Rodrigues(rvec, R_matrix);
-        R_matrix = R_matrix.t();
-        Mat t_vec = -R_matrix * tvec;
-
-        Mat inv_transform = Mat::zeros(3, 4, CV_64F);
-        R_matrix.col(0).copyTo(inv_transform.col(0));
-        R_matrix.col(1).copyTo(inv_transform.col(1));
-        R_matrix.col(2).copyTo(inv_transform.col(2));
-        t_vec.copyTo(inv_transform.col(3));
-
-        // if (inliers_ratio < 0.9) {
-        create_new_features(i, inv_transform, featurePoints, landmarks);
-        // }
-
-        ref_img = curImg;
-        // featurePoints = featurePoints_ref_inlier;
-        // landmarks     = landmarks_ref;
-
-        // plot the information
-        t_vec.convertTo(t_vec, CV_32F);
-
-        cout << t_vec.t() << endl;
-        cout << "[" << poses[i][3] << ", " << poses[i][7] << ", " << poses[i][11] << "]" << endl;
-
-        Point2f center = Point2f(int(t_vec.at<float>(0)) + 300, int(t_vec.at<float>(2)) + 100);
-        Point2f t_center = Point2f(int(poses[i][3]) + 300, int(poses[i][11]) + 100);
-        circle(traj, center, 1, Scalar(0, 0, 255), 2);
-        circle(traj, t_center, 1, Scalar(255, 0, 0), 2);
-
-        rectangle(traj, Point2f(10, 30), Point2f(550, 50), Scalar(0, 0, 0), cv::FILLED);
-        putText(traj, "estimated", Point2f(10, 50), cv::FONT_HERSHEY_PLAIN, 1, Scalar(0, 0, 255), 1, 5);
-        putText(traj, "groundtruth", Point2f(10, 70), cv::FONT_HERSHEY_PLAIN, 1, Scalar(255, 0, 0), 1, 5);
-
-        imshow("Trajectory", traj);
-        imshow("img", curImg);
-        waitKey(1);
-    }
-    imwrite("map2.png", traj);
-    waitKey(0);
+    return std::make_shared<Point2f>(t_vec.at<float>(0), t_vec.at<float>(2));
 }
 
 
@@ -266,12 +217,4 @@ std::vector<vector<float>> VO::get_Pose(const std::string &path) {
 }
 
 
-Mat VO::getImage(const string &raw_path, int i) {
-    char path[200];
-    sprintf(path, raw_path.c_str(), i);
-    Mat img = imread(path);
-    if (!img.data) { // Check for invalid input
-        cerr << "Could not open or find the image" << std::endl;
-    }
-    return img;
-}
+
